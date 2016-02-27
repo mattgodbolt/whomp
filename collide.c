@@ -45,6 +45,13 @@ xsrand(uint64_t x) {
 }
 /////////////////////////////////////
 
+typedef struct _Counter
+{
+    int fd;
+    struct perf_event_mmap_page *buf;
+    int pmc_reg;
+} Counter;
+
 long
 perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
     int cpu, int group_fd, unsigned long flags)
@@ -55,8 +62,8 @@ perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
     return ret;
 }
 
-int
-open_perf_counter(int event)
+void
+open_perf_counter(int event, Counter *counter)
 {
     int fd;
     struct perf_event_attr pe = { 0 };
@@ -64,12 +71,24 @@ open_perf_counter(int event)
     pe.type = PERF_TYPE_RAW;
     pe.config = event;
     pe.disabled = 1;
+    pe.pinned = 1;
     pe.exclude_kernel = 1;
     pe.exclude_hv = 1;
     fd = perf_event_open(&pe, 0, -1, -1, 0);
     if (fd == -1)
         err(EXIT_FAILURE, "Error opening leader %llx", pe.config);
-    return fd;
+    counter->fd = fd;
+    counter->buf = (struct perf_event_mmap_page *)mmap(
+            NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (counter->buf == MAP_FAILED)
+        err(EXIT_FAILURE, "Error mapping %llx", pe.config);
+    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    counter->pmc_reg = counter->buf->index - 1;
+}
+
+void close_perf_counter(Counter *counter) {
+    munmap(counter->buf, 4096);
+    close(counter->fd);
 }
 
 struct cpu_model {
@@ -152,29 +171,35 @@ inline uint64_t rdpmc(uint32_t ctr) {
     return to;
 }
 
+inline void serialize() {
+    __asm__ __volatile__("xor %%eax, %%eax\n\tcpuid" : : : "rax", "rbx", "rcx", "rdx");
+}
+
 long
-count_perf(void (*func)())
+count_perf(void (*func)(), Counter *counter)
 {
     // warm up
     func(); func(); func(); func(); func();
     func(); func(); func(); func(); func();
 
-    uint64_t before = rdpmc(0);
+    serialize();
+    uint64_t before = rdpmc(counter->pmc_reg);
     // running the function 10x makes any consistent perf events
     // occur repeatedly, helping to separate them from background noise
     func(); func(); func(); func(); func();
     func(); func(); func(); func(); func();
-    uint64_t after = rdpmc(0);
+    serialize();
+    uint64_t after = rdpmc(counter->pmc_reg);
 
     return after - before;
 }
 
 long
-count_perf_min(void (*func)(), int iters)
+count_perf_min(void (*func)(), int iters, Counter *counter)
 {
     long min_count = LONG_MAX;
     for (int i = 0; i < iters; i++) {
-        long count = count_perf(func);
+        long count = count_perf(func, counter);
         if (count < min_count)
             min_count = count;
     }
@@ -267,10 +292,8 @@ main(int argc, char **argv)
 
     printf("# -j%d -b%d -s%ld\n", jumps, nbits, seed);
 
-    bindToCpu(1);
-    int fd = open_perf_counter(determine_perf_event());
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    Counter counter;
+    open_perf_counter(determine_perf_event(), &counter);
 
     // Create a function from a series of unconditional jumps
 
@@ -302,7 +325,7 @@ main(int argc, char **argv)
 
     void (*func)() = (void(*)())buf + jump_addrs[0];
 
-    long clears = count_perf_min(func, runs * 10);
+    long clears = count_perf_min(func, runs * 10, &counter);
     printf("BACLEARS: %ld\n", clears);
 
     if (clears < 10) {
@@ -317,7 +340,7 @@ main(int argc, char **argv)
     printf("N   addr      clears\n");
     for (int i = 1; i < jumps - 1; i++) {
         write_jump(buf, jump_addrs[i - 1], jump_addrs[i + 1]);  // skip this jump
-        long modified_clears = count_perf_min(func, runs);
+        long modified_clears = count_perf_min(func, runs, &counter);
         if (modified_clears < clears - 6) {
             uintptr_t addr = (uintptr_t)buf + jump_addrs[i];
             printf("%03d %8lx %ld\n", i, addr, modified_clears);
@@ -333,5 +356,5 @@ main(int argc, char **argv)
     }
     printf("mask: %08x\n", mask);
 
-    close(fd);
+    close_perf_counter(&counter);
 }
